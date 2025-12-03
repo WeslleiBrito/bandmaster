@@ -29,11 +29,14 @@ public class CommissionProcessingService {
     private final CommissionStatusRepository statusRepository;
     private final ReceivableInstallmentRepository receivableInstallmentRepository;
     private final ReceivableHistoryRepository receivableHistoryRepository;
+    private final SalespersonReversalDeductionRepository deductionRepository;
     private final DateUtils dateUtils;
 
-    /**
-     * Passo 1: Gera as parcelas de comissão para vendas novas
-     */
+    // ============================================================================================
+    // PASSO 1: GERAÇÃO (INSERTS)
+    // Cria os registros físicos no banco de dados.
+    // ============================================================================================
+
     @Transactional
     public void generateCommissionInstallments() {
         log.info("Iniciando geração de parcelas de comissão...");
@@ -52,211 +55,173 @@ public class CommissionProcessingService {
                 log.error("Erro ao processar comissão id: {}", prodComm.getId(), e);
             }
         }
-        log.info("Geração de parcelas finalizada.");
+        log.info("Geração finalizada.");
     }
 
-    private void processSingleProductCommission(ProductCommission prodComm, CommissionStatus blocked, CommissionStatus waiting) {
+    private void processSingleProductCommission(ProductCommission prodComm, CommissionStatus statusBlocked, CommissionStatus statusWaiting) {
         BigDecimal totalCommission = prodComm.getRevenue()
                 .multiply(prodComm.getCommissionPercentage())
                 .divide(BigDecimal.valueOf(100), 4, RoundingMode.HALF_UP);
 
         List<ReceivableInstallment> parcels = receivableInstallmentRepository.findValidParcelsBySaleId(prodComm.getSaleId());
-
         if (parcels.isEmpty()) return;
 
         BigDecimal totalParcelsValue = parcels.stream()
-                .map(ReceivableInstallment::getTitleValue) // Corrigido: Usa Valor do Título para rateio
+                .map(ReceivableInstallment::getTitleValue)
                 .reduce(BigDecimal.ZERO, BigDecimal::add);
 
         if (totalParcelsValue.compareTo(BigDecimal.ZERO) == 0) return;
 
         for (ReceivableInstallment parcel : parcels) {
-            BigDecimal proportion = parcel.getTitleValue()
-                    .divide(totalParcelsValue, 10, RoundingMode.HALF_UP);
+            BigDecimal proportion = parcel.getTitleValue().divide(totalParcelsValue, 10, RoundingMode.HALF_UP);
+            BigDecimal commissionValue = totalCommission.multiply(proportion).setScale(4, RoundingMode.HALF_UP);
+            BigDecimal equivalentRevenue = prodComm.getRevenue().multiply(proportion).setScale(4, RoundingMode.HALF_UP);
 
-            BigDecimal commissionValue = totalCommission
-                    .multiply(proportion)
-                    .setScale(4, RoundingMode.HALF_UP);
-
-            BigDecimal equivalentRevenue = prodComm.getRevenue()
-                    .multiply(proportion)
-                    .setScale(4, RoundingMode.HALF_UP);
-
+            // REGRA: Se Prazo 'P' -> Aguardando. Outros (Vista) -> Bloqueada.
             String term = parcel.getPaymentMethod() != null ? parcel.getPaymentMethod().getTerm() : "";
-            CommissionStatus initialStatus = (term.equalsIgnoreCase("P") || term.equalsIgnoreCase("H"))
-                    ? waiting : blocked;
+            CommissionStatus initialStatus = "P".equalsIgnoreCase(term) ? statusWaiting : statusBlocked;
 
             CommissionInstallment installment = new CommissionInstallment();
             installment.setProductCommission(prodComm);
-            installment.setInstallment(parcel); // Passa o objeto Parcel completo
+            installment.setInstallment(parcel);
             installment.setTotalCommissionValue(commissionValue);
             installment.setEquivalentRevenue(equivalentRevenue);
             installment.setStatus(initialStatus);
 
             commissionInstallmentRepository.save(installment);
         }
-
         prodComm.setProcessed(true);
         productCommissionRepository.save(prodComm);
     }
 
-    /**
-     * Passo 2: Atualiza o status (Bloqueada -> Liberada/Paga) baseado no financeiro
-     */
-    @Transactional
-    public void updateCommissionStatuses() {
-        log.info("Iniciando atualização de status das comissões...");
+    // ============================================================================================
+    // PASSO 2: RELATÓRIO VIRTUAL (READ-ONLY)
+    // Calcula status e splits em tempo real para o JSON.
+    // ============================================================================================
 
-        List<CommissionInstallment> installments = commissionInstallmentRepository.findAll();
-        LocalDate today = LocalDate.now();
-
-        // Carrega status para memória
-        CommissionStatus stPaid = statusRepository.findByName("PAGA").orElseThrow();
-        CommissionStatus stReversed = statusRepository.findByName("ESTORNADA").orElseThrow();
-        CommissionStatus stWaiting = statusRepository.findByName("AGUARDANDO PAGAMENTO").orElseThrow();
-        CommissionStatus stFree = statusRepository.findByName("LIBERADA").orElseThrow();
-        CommissionStatus stBlocked = statusRepository.findByName("BLOQUEADA").orElseThrow();
-
-        for (CommissionInstallment installment : installments) {
-            // Se não tem parcela financeira, pula
-            if (installment.getInstallment() == null) continue;
-
-            // Busca histórico financeiro
-            List<ReceivableHistory> histories = receivableHistoryRepository.findByInstallmentId(installment.getInstallment().getId());
-
-            BigDecimal receivedValue = BigDecimal.ZERO;
-            BigDecimal reversedValue = BigDecimal.ZERO;
-            LocalDate lastPaymentDate = null;
-
-            for (ReceivableHistory h : histories) {
-                if ("E".equals(h.getStatus())) {
-                    reversedValue = reversedValue.add(h.getValue());
-                } else {
-                    receivedValue = receivedValue.add(h.getValue());
-                    if (lastPaymentDate == null || (h.getPaymentDate() != null && h.getPaymentDate().isAfter(lastPaymentDate))) {
-                        lastPaymentDate = h.getPaymentDate();
-                    }
-                }
-            }
-
-            BigDecimal liquidValue = receivedValue.subtract(reversedValue);
-
-            // Soma o que já foi pago de comissão (se houver pagamentos parciais)
-            BigDecimal commissionPaid = BigDecimal.ZERO;
-            if (installment.getPayments() != null) {
-                commissionPaid = installment.getPayments().stream()
-                        .map(CommissionPayment::getPaidValue)
-                        .reduce(BigDecimal.ZERO, BigDecimal::add);
-            }
-
-            // Lógica de decisão de Status
-            CommissionStatus newStatus;
-
-            if (commissionPaid.compareTo(installment.getTotalCommissionValue()) >= 0) {
-                newStatus = stPaid;
-            } else if (reversedValue.compareTo(BigDecimal.ZERO) > 0
-                    && commissionPaid.compareTo(liquidValue) > 0) {
-                newStatus = stReversed;
-            } else if (liquidValue.compareTo(BigDecimal.ZERO) <= 0) {
-                newStatus = stWaiting;
-            } else {
-                // Lógica da data limite (5º dia útil)
-                LocalDate limitDate = dateUtils.getFifthBusinessDayOfNextMonth(lastPaymentDate);
-
-                if (limitDate != null && !today.isBefore(limitDate)) {
-                    newStatus = stFree; // LIBERADA
-                } else {
-                    newStatus = stBlocked;
-                }
-            }
-
-            // Só atualiza no banco se mudou o status
-            if (installment.getStatus() == null || !installment.getStatus().getId().equals(newStatus.getId())) {
-                installment.setStatus(newStatus);
-                commissionInstallmentRepository.save(installment);
-            }
-        }
-        log.info("Atualização de status finalizada.");
-    }
-
-    /**
-     * Passo 3: Gera o relatório detalhado para API (JSON)
-     */
     @Transactional(readOnly = true)
     public Map<String, List<CommissionDetailDTO>> getDetailedCommissionsMap() {
         Map<String, List<CommissionDetailDTO>> result = new java.util.HashMap<>();
         result.put("AGUARDANDO PAGAMENTO", new ArrayList<>());
         result.put("BLOQUEADA", new ArrayList<>());
+        result.put("LIBERADA", new ArrayList<>());
         result.put("PAGA", new ArrayList<>());
         result.put("ESTORNADA", new ArrayList<>());
-        result.put("LIBERADA", new ArrayList<>());
 
         List<CommissionInstallment> allInstallments = commissionInstallmentRepository.findAllWithDetails();
+        LocalDate today = LocalDate.now();
 
         for (CommissionInstallment c : allInstallments) {
             if (c.getInstallment() == null) continue;
 
+            // 1. Coleta dados financeiros
             List<ReceivableHistory> histories = receivableHistoryRepository.findByInstallmentId(c.getInstallment().getId());
-            BigDecimal valorRecebido = BigDecimal.ZERO;
-            BigDecimal valorEstornado = BigDecimal.ZERO;
-            LocalDate lastPaymentDate = null;
+            BigDecimal valorRecebidoCliente = BigDecimal.ZERO;
+            BigDecimal valorEstornadoCliente = BigDecimal.ZERO;
+            LocalDate dataUltimoPagamento = null;
 
             for (ReceivableHistory h : histories) {
                 if ("E".equals(h.getStatus())) {
-                    valorEstornado = valorEstornado.add(h.getValue());
+                    valorEstornadoCliente = valorEstornadoCliente.add(h.getValue());
                 } else {
-                    valorRecebido = valorRecebido.add(h.getValue());
-                    if (lastPaymentDate == null || (h.getPaymentDate() != null && h.getPaymentDate().isAfter(lastPaymentDate))) {
-                        lastPaymentDate = h.getPaymentDate();
+                    valorRecebidoCliente = valorRecebidoCliente.add(h.getValue());
+                    if (dataUltimoPagamento == null || (h.getPaymentDate() != null && h.getPaymentDate().isAfter(dataUltimoPagamento))) {
+                        dataUltimoPagamento = h.getPaymentDate();
                     }
                 }
             }
 
-            LocalDate dataLimite = null;
-            if (valorRecebido.compareTo(BigDecimal.ZERO) > 0) {
-                dataLimite = dateUtils.getFifthBusinessDayOfNextMonth(lastPaymentDate);
+            BigDecimal valorLiquidoCliente = valorRecebidoCliente.subtract(valorEstornadoCliente);
+            if (valorLiquidoCliente.compareTo(BigDecimal.ZERO) < 0) valorLiquidoCliente = BigDecimal.ZERO;
+
+            // 2. Coleta dados do Vendedor
+            BigDecimal jaPagoAoVendedor = c.getPayments() != null ?
+                    c.getPayments().stream().map(CommissionPayment::getPaidValue).reduce(BigDecimal.ZERO, BigDecimal::add)
+                    : BigDecimal.ZERO;
+
+            List<SalespersonReversalDeduction> abatimentos = deductionRepository.findByCommissionInstallmentId(c.getId());
+            BigDecimal jaAbatidoPeloVendedor = abatimentos.stream()
+                    .map(SalespersonReversalDeduction::getDeductedValue)
+                    .reduce(BigDecimal.ZERO, BigDecimal::add);
+
+            BigDecimal saldoDevedorVendedor = jaPagoAoVendedor.subtract(jaAbatidoPeloVendedor);
+            if (saldoDevedorVendedor.compareTo(BigDecimal.ZERO) < 0) saldoDevedorVendedor = BigDecimal.ZERO;
+
+            // 3. Aplicação das Regras
+            BigDecimal valorTitulo = c.getInstallment().getTitleValue();
+            BigDecimal totalComissao = c.getTotalCommissionValue();
+
+            if (valorTitulo.compareTo(BigDecimal.ZERO) == 0) continue;
+
+            // REGRA 5: ESTORNADA (Cliente devolveu e vendedor deve)
+            if (valorEstornadoCliente.compareTo(BigDecimal.ZERO) > 0 && saldoDevedorVendedor.compareTo(BigDecimal.ZERO) > 0) {
+                CommissionDetailDTO dto = createDTO(c, saldoDevedorVendedor, null);
+                result.get("ESTORNADA").add(dto);
+                continue; // Interrompe para este item
             }
 
-            BigDecimal comissaoPaga = BigDecimal.ZERO;
-            if (c.getPayments() != null) {
-                comissaoPaga = c.getPayments().stream()
-                        .map(CommissionPayment::getPaidValue)
-                        .reduce(BigDecimal.ZERO, BigDecimal::add);
+            // Cálculo Proporcional (Split)
+            BigDecimal percentualPago = valorLiquidoCliente.divide(valorTitulo, 4, RoundingMode.HALF_UP);
+            if (percentualPago.compareTo(BigDecimal.ONE) > 0) percentualPago = BigDecimal.ONE;
+
+            BigDecimal comissaoVirtualRecebida = totalComissao.multiply(percentualPago).setScale(2, RoundingMode.HALF_UP);
+            BigDecimal comissaoVirtualPendente = totalComissao.subtract(comissaoVirtualRecebida).setScale(2, RoundingMode.HALF_UP);
+
+            // Parte Recebida (Regras 1, 3, 4)
+            if (comissaoVirtualRecebida.compareTo(BigDecimal.ZERO) > 0) {
+                String statusDestino;
+
+                if (jaPagoAoVendedor.compareTo(comissaoVirtualRecebida) >= 0) {
+                    statusDestino = "PAGA"; // Regra 4
+                } else {
+                    LocalDate dataLimite = null;
+                    if (dataUltimoPagamento != null) {
+                        dataLimite = dateUtils.getFifthBusinessDayOfNextMonth(dataUltimoPagamento);
+                    }
+
+                    if (dataLimite != null && !today.isBefore(dataLimite)) {
+                        statusDestino = "LIBERADA"; // Regra 3
+                    } else {
+                        statusDestino = "BLOQUEADA"; // Regra 1
+                    }
+                }
+
+                CommissionDetailDTO dtoParteA = createDTO(c, comissaoVirtualRecebida,
+                        (statusDestino.equals("LIBERADA") || statusDestino.equals("BLOQUEADA")) && dataUltimoPagamento != null
+                                ? dateUtils.getFifthBusinessDayOfNextMonth(dataUltimoPagamento).toString()
+                                : null);
+                result.get(statusDestino).add(dtoParteA);
             }
 
-            // Montagem Segura do DTO
-            boolean hasProductComm = c.getProductCommission() != null;
-            boolean hasEmployee = hasProductComm && c.getProductCommission().getEmployee() != null;
-            boolean hasProduct = hasProductComm && c.getProductCommission().getProduct() != null;
-
-            Long vendedorId = hasEmployee ? c.getProductCommission().getEmployee().getId() : 0L;
-            String vendedorNome = hasEmployee ? c.getProductCommission().getEmployee().getName() : "Vendedor N/D";
-            Long produtoId = hasProduct ? c.getProductCommission().getProduct().getId() : 0L;
-            String produtoDesc = hasProduct ? c.getProductCommission().getProduct().getDescription() : "Produto Removido";
-            Long vendaId = hasProductComm ? c.getProductCommission().getSaleId() : 0L;
-            LocalDateTime dataVenda = hasProductComm ? c.getProductCommission().getCreatedAt() : null;
-
-            CommissionDetailDTO dto = new CommissionDetailDTO(
-                    vendedorId,
-                    vendedorNome,
-                    c.getId(),
-                    produtoId,
-                    produtoDesc,
-                    vendaId,
-                    dataVenda,
-                    c.getInstallment().getId(),
-                    c.getEquivalentRevenue(),
-                    valorRecebido,
-                    valorEstornado,
-                    c.getTotalCommissionValue(),
-                    comissaoPaga,
-                    (dataLimite != null) ? dataLimite.toString() : null
-            );
-
-            String statusName = (c.getStatus() != null) ? c.getStatus().getName() : "BLOQUEADA";
-            result.computeIfAbsent(statusName, k -> new ArrayList<>()).add(dto);
+            // Parte Pendente (Regra 2)
+            if (comissaoVirtualPendente.compareTo(BigDecimal.ZERO) > 0) {
+                CommissionDetailDTO dtoParteB = createDTO(c, comissaoVirtualPendente, null);
+                result.get("AGUARDANDO PAGAMENTO").add(dtoParteB);
+            }
         }
 
         return result;
+    }
+
+    private CommissionDetailDTO createDTO(CommissionInstallment c, BigDecimal valorComissaoVirtual, String dataLimite) {
+        boolean hasEmployee = c.getProductCommission().getEmployee() != null;
+        boolean hasProduct = c.getProductCommission().getProduct() != null;
+
+        return new CommissionDetailDTO(
+                hasEmployee ? c.getProductCommission().getEmployee().getId() : 0L,
+                hasEmployee ? c.getProductCommission().getEmployee().getName() : "N/D",
+                c.getId(),
+                hasProduct ? c.getProductCommission().getProduct().getId() : 0L,
+                hasProduct ? c.getProductCommission().getProduct().getDescription() : "N/D",
+                c.getProductCommission().getSaleId(),
+                c.getProductCommission().getCreatedAt(),
+                c.getInstallment().getId(),
+                c.getEquivalentRevenue(),
+                BigDecimal.ZERO,
+                BigDecimal.ZERO,
+                valorComissaoVirtual,
+                BigDecimal.ZERO,
+                dataLimite
+        );
     }
 }

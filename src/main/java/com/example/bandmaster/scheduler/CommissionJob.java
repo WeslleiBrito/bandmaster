@@ -23,7 +23,6 @@ public class CommissionJob {
         try {
             // 1. Processamento Pesado (Escrita no Banco)
             commissionService.generateCommissionInstallments();
-            commissionService.updateCommissionStatuses();
 
             // 2. Geração do Relatório para Cache (Leitura Pesada)
             log.info("Atualizando cache do relatório de comissões...");
